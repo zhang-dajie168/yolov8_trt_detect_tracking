@@ -1,0 +1,14 @@
+# params.yaml
+Yolov8HandTrackNode:
+  ros__parameters:
+    model_path: '/home/wheeltec/Ebike_Human_Follower/src/yolov8_trt_detect_tracking/models/yolov8.engine'
+    reid_model_path: '/home/wheeltec/Ebike_Human_Follower/src/yolov8_trt_detect_tracking/models/osnet_x0_25.engine'
+    conf_threshold: 0.3
+    max_processing_fps: 15
+    ok_confirm_frames: 10
+    tracking_protection_time: 5.0
+    reid_similarity_threshold: 0.8
+    height_change_threshold: 0.15
+    lost_timeout_threshold: 10.0
+    use_cuda: true
+    roi_threshold: 0.5
