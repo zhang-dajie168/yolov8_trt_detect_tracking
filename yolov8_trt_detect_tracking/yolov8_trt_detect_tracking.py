@@ -14,10 +14,41 @@ from typing import List, Dict, Optional, Tuple
 from collections import deque
 import copy
 import os
+import pycuda.driver as cuda
+import pycuda.autoinit
 
 # 导入TensorRT版本的模型
 from .YOLOv8_TensorRT import YOLOv8TensorRT  # 修正类名
 from .BOTSort_rdk import BOTSORT
+
+
+class SharedCUDAManager:
+    """共享CUDA上下文管理器 - 解决上下文冲突"""
+    _instance = None
+    _context = None
+    _ref_count = 0
+    
+    def __new__(cls):
+        if cls._instance is None:
+            cls._instance = super().__new__(cls)
+        return cls._instance
+    
+    def acquire(self):
+        """获取CUDA上下文"""
+        if self._context is None:
+            device = cuda.Device(0)
+            self._context = device.retain_primary_context()
+            self._context.push()
+        self._ref_count += 1
+        return self._context
+    
+    def release(self):
+        """释放CUDA上下文"""
+        self._ref_count -= 1
+        if self._ref_count <= 0 and self._context:
+            self._context.pop()
+            self._context = None
+            self._ref_count = 0
 
 
 class TrackedTarget:
@@ -74,6 +105,10 @@ class TrackedTarget:
 class Yolov8HandTrackNode(Node):
     def __init__(self):
         super().__init__('Yolov8HandTrackNode')
+        
+        # 共享CUDA管理器
+        self.cuda_manager = SharedCUDAManager()
+        self.cuda_manager.acquire()
 
         # 声明参数
         self._declare_parameters()
@@ -95,8 +130,8 @@ class Yolov8HandTrackNode(Node):
 
     def _declare_parameters(self):
         """声明所有参数"""
-        self.declare_parameter('model_path', '/home/wheeltec/Ebike_Human_Follower/src/yolov8_pytorch_detect_tracking/models/yolov8.engine')
-        self.declare_parameter('reid_engine_path', '/home/wheeltec/Ebike_Human_Follower/src/yolov8_pytorch_detect_tracking/models/osnet_x0_25.engine')
+        self.declare_parameter('model_path', '/home/wheeltec/Ebike_Human_Follower/src/yolov8_trt_detect_tracking/models/yolov8.engine')
+        self.declare_parameter('reid_engine_path', '/home/wheeltec/Ebike_Human_Follower/src/yolov8_trt_detect_tracking/models/osnet_x0_25.engine')
         self.declare_parameter('conf_threshold', 0.3)
         self.declare_parameter('nms_threshold', 0.45)
         self.declare_parameter('max_processing_fps', 15)
@@ -156,7 +191,8 @@ class Yolov8HandTrackNode(Node):
             self.model = YOLOv8TensorRT(
                 self.model_path, 
                 self.conf_threshold, 
-                self.nms_threshold
+                self.nms_threshold,
+                shared_context=True  # 使用共享上下文模式
             )
             self.get_logger().info("✅ YOLO TensorRT模型初始化成功")
         except Exception as e:
@@ -165,6 +201,12 @@ class Yolov8HandTrackNode(Node):
         
         # 初始化BOTSORT跟踪器（TensorRT ReID）
         reid_enabled = self.with_reid and os.path.exists(self.reid_engine_path)
+        
+        # 检查ReID引擎文件
+        if self.with_reid and not os.path.exists(self.reid_engine_path):
+            self.get_logger().warning(f"⚠️ ReID引擎文件不存在: {self.reid_engine_path}")
+            self.get_logger().warning("   请检查路径或复制文件到正确位置")
+            reid_enabled = False
         
         # 重要：如果启用ReID，等待一下让YOLO完全初始化
         if reid_enabled:
@@ -201,7 +243,7 @@ class Yolov8HandTrackNode(Node):
         self.bridge = CvBridge()
         
         # 创建订阅和发布
-        self.image_sub = self.create_subscription(Image, '/camera/color/image_raw', self.image_callback, 10)
+        self.image_sub = self.create_subscription(Image, '/LxCamera_Rgb', self.image_callback, 10)
         self.detect_pose_pub = self.create_publisher(Image, 'tracks', 10)
         self.keypoint_tracks_pub = self.create_publisher(PolygonStamped, '/keypoint_tracks', 10)
 
@@ -310,12 +352,12 @@ class Yolov8HandTrackNode(Node):
             return np.zeros(512, dtype=np.float32)
         
         try:
-            if self.tracker.encoder is not None:
+            if hasattr(self.tracker, 'encoder') and self.tracker.encoder is not None:
                 return self.tracker.encoder.extract_feature(crop)
             else:
                 return np.zeros(512, dtype=np.float32)
         except Exception as e:
-            self.get_logger().warn(f"Feature extraction failed: {e}")
+            self.get_logger().debug(f"Feature extraction failed: {e}")
             return np.zeros(512, dtype=np.float32)
         
     def save_tracked_target(self, track_id: int, bbox: List[float], image: np.ndarray, timestamp: float):
@@ -514,14 +556,6 @@ class Yolov8HandTrackNode(Node):
                 elif class_id == 2:  # stop手势
                     stop_gestures.append((x1, y1, x2, y2, score))
 
-
-            # ========== 新增：打印检测到的人数 ==========
-            person_count = len(person_detections)
-            if person_count > 0:
-                self.get_logger().info(f"👤 当前检测到的人数: {person_count}")
-            else:
-                self.get_logger().info(f"👤 当前检测到的人数: 0 (未检测到人)")
-            # ========================================
             
             # 跟踪person检测结果
             tracking_results = self.tracker.update(person_detections, cv_image)
@@ -875,11 +909,12 @@ class Yolov8HandTrackNode(Node):
             track_id = tracking_target_in_frame['track_id']
             x1, y1, x2, y2 = tracking_target_in_frame['bbox']
             
+            # 修复：确保列表正确闭合
             points = [
                 Point32(x=float(track_id), y=1.0, z=2.0),
                 Point32(x=float(x1), y=float(y1), z=0.0),
-                Point32(x=float(x2), y=float(y2), z=0.0),
-            ]
+                Point32(x=float(x2), y=float(y2), z=0.0)
+            ]  # 这里必须正确闭合
             polygon_msg.polygon.points = points
             self.get_logger().info(f"📤 发布跟踪信息: ID {track_id}, bbox: ({x1},{y1})-({x2},{y2})")
             
@@ -887,17 +922,29 @@ class Yolov8HandTrackNode(Node):
             points = [
                 Point32(x=float(current_tracking_id), y=0.0, z=0.0),
                 Point32(x=0.0, y=0.0, z=0.0),
-                Point32(x=0.0, y=0.0, z=0.0),
-            ]
+                Point32(x=0.0, y=0.0, z=0.0)
+            ]  # 这里必须正确闭合
             polygon_msg.polygon.points = points
             self.get_logger().info(f"📤 发布目标丢失状态: ID {current_tracking_id}")
             
         else:
-            points = [Point32(x=0.0, y=0.0, z=0.0) for _ in range(3)]
+            points = [
+                Point32(x=0.0, y=0.0, z=0.0),
+                Point32(x=0.0, y=0.0, z=0.0),
+                Point32(x=0.0, y=0.0, z=0.0)
+            ]  # 这里必须正确闭合
             polygon_msg.polygon.points = points
             self.get_logger().debug("无跟踪目标，发布空状态")
         
         self.keypoint_tracks_pub.publish(polygon_msg)
+    
+    def __del__(self):
+        """清理资源"""
+        try:
+            # 释放CUDA上下文
+            self.cuda_manager.release()
+        except:
+            pass
 
 
 def main(args=None):

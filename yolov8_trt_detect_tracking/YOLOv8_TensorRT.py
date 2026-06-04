@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 """
-TensorRT YOLOv8 推理脚本 - 修正版（坐标已是像素值）
+TensorRT YOLOv8 推理脚本 - 共享CUDA上下文版本
 """
 
 import os
@@ -11,15 +11,51 @@ import tensorrt as trt
 import pycuda.driver as cuda
 import pycuda.autoinit
 
+# 全局CUDA上下文管理器
+class SharedCUDAManager:
+    """共享CUDA上下文管理器"""
+    _instance = None
+    _context = None
+    _ref_count = 0
+    
+    def __new__(cls):
+        if cls._instance is None:
+            cls._instance = super().__new__(cls)
+        return cls._instance
+    
+    def acquire(self):
+        """获取CUDA上下文"""
+        if self._context is None:
+            device = cuda.Device(0)
+            self._context = device.retain_primary_context()
+            self._context.push()
+        self._ref_count += 1
+        return self._context
+    
+    def release(self):
+        """释放CUDA上下文"""
+        self._ref_count -= 1
+        if self._ref_count <= 0 and self._context:
+            self._context.pop()
+            self._context = None
+            self._ref_count = 0
+
+# 全局上下文管理器实例
+_shared_cuda_manager = SharedCUDAManager()
+
 class YOLOv8TensorRT:
-    def __init__(self, engine_path, conf_thres=0.3, nms_thres=0.5):
+    def __init__(self, engine_path, conf_thres=0.3, nms_thres=0.5, shared_context=True):
         self.conf_thres = conf_thres
         self.nms_thres = nms_thres
         self.engine_path = engine_path
+        self.shared_context = shared_context
         
-        # 创建独立的CUDA上下文
-        self.cuda_ctx = None
-        self._init_cuda_context()
+        # 获取共享CUDA上下文
+        if shared_context:
+            self.cuda_ctx = _shared_cuda_manager.acquire()
+        else:
+            self.cuda_ctx = None
+            self._init_cuda_context()
         
         # 加载引擎
         print(f"Loading engine: {engine_path}")
@@ -74,9 +110,7 @@ class YOLOv8TensorRT:
     def _init_cuda_context(self):
         """初始化独立的CUDA上下文"""
         try:
-            # 获取当前设备
             device = cuda.Device(0)
-            # 创建新的上下文
             self.cuda_ctx = device.retain_primary_context()
             self.cuda_ctx.push()
         except Exception as e:
@@ -120,7 +154,8 @@ class YOLOv8TensorRT:
     
     def detect(self, img):
         """检测 - 添加错误恢复"""
-        self._ensure_context()
+        if not self.shared_context:
+            self._ensure_context()
         
         try:
             input_tensor = self.preprocess(img)
@@ -148,10 +183,6 @@ class YOLOv8TensorRT:
             
         except Exception as e:
             print(f"YOLO detection error: {e}")
-            # 重置上下文
-            if self.cuda_ctx:
-                self.cuda_ctx.pop()
-                self.cuda_ctx.push()
             return [], 0
     
     def postprocess(self, output):
@@ -279,12 +310,11 @@ class YOLOv8TensorRT:
             for out in self.outputs:
                 if 'device' in out:
                     out['device'].free()
-            if self.cuda_ctx:
+            if not self.shared_context and self.cuda_ctx:
                 self.cuda_ctx.pop()
                 del self.cuda_ctx
         except:
             pass
-
 
 def draw_detections(image, detections, class_names):
     """绘制检测结果"""
