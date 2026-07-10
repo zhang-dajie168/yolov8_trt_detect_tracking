@@ -1,54 +1,63 @@
 #!/usr/bin/env python3
 """
-OSNet TensorRT推理类 - 优化版（修复上下文冲突）
+OSNet TensorRT推理类 - 线程局部上下文优化版
 """
 
 import os
 import cv2
 import numpy as np
 import time
+import threading
 import tensorrt as trt
 import pycuda.driver as cuda
 import pycuda.autoinit
 
-# 全局CUDA上下文管理器
-class CUDAManager:
-    """全局CUDA上下文管理器"""
-    _instance = None
-    _context = None
+
+class ThreadLocalCUDAManager:
+    """线程局部CUDA上下文管理器 - 避免频繁push/pop"""
+    _thread_local = threading.local()
+    _global_context = None
+    _lock = threading.Lock()
+    _ref_count = 0
     
-    def __new__(cls):
-        if cls._instance is None:
-            cls._instance = super().__new__(cls)
-        return cls._instance
+    @classmethod
+    def get_context(cls):
+        """获取当前线程的CUDA上下文（每个线程只push一次）"""
+        if not hasattr(cls._thread_local, 'context'):
+            with cls._lock:
+                if cls._global_context is None:
+                    device = cuda.Device(0)
+                    cls._global_context = device.retain_primary_context()
+                    print("✅ Created global CUDA primary context")
+                # 每个线程独立push一次
+                cls._global_context.push()
+                cls._thread_local.context = cls._global_context
+                cls._ref_count += 1
+                print(f"Thread {threading.current_thread().name}: CUDA context pushed (ref: {cls._ref_count})")
+        return cls._thread_local.context
     
-    def get_context(self):
-        if self._context is None:
-            device = cuda.Device(0)
-            self._context = device.retain_primary_context()
-        return self._context
-    
-    def push(self):
-        ctx = self.get_context()
-        ctx.push()
-    
-    def pop(self):
-        if self._context:
-            self._context.pop()
+    @classmethod
+    def release_thread(cls):
+        """释放当前线程的CUDA上下文"""
+        if hasattr(cls._thread_local, 'context'):
+            cls._thread_local.context.pop()
+            delattr(cls._thread_local, 'context')
+            cls._ref_count -= 1
+            print(f"Thread {threading.current_thread().name}: CUDA context popped (ref: {cls._ref_count})")
 
 
 class OSNetTensorRTInference:
-    """OSNet TensorRT推理类 - 使用全局上下文管理"""
+    """OSNet TensorRT推理类 - 线程局部上下文优化版"""
     
     def __init__(self, engine_path, input_size=(256, 128), batch_size=1):
         self.input_size = input_size
         self.height, self.width = input_size
         self.feature_dim = 512
         self.batch_size = batch_size
-        self.cuda_manager = CUDAManager()
+        self.engine_path = engine_path
         
-        # 确保CUDA上下文
-        self.cuda_manager.push()
+        # 获取线程局部上下文（只push一次）
+        self.cuda_ctx = ThreadLocalCUDAManager.get_context()
         
         # 加载引擎
         print(f"Loading TensorRT engine: {engine_path}")
@@ -66,17 +75,16 @@ class OSNetTensorRTInference:
                 name = self.engine.get_tensor_name(i)
                 if self.engine.get_tensor_mode(name) == trt.TensorIOMode.INPUT:
                     self.input_names.append(name)
-                    print(f"Input: {name}, shape: {self.engine.get_tensor_shape(name)}")
+                    print(f"  Input: {name}")
                 else:
                     self.output_names.append(name)
-                    print(f"Output: {name}, shape: {self.engine.get_tensor_shape(name)}")
+                    print(f"  Output: {name}")
             
             # 设置具体的输入shape
             input_shape = (self.batch_size, 3, self.height, self.width)
             self.context.set_input_shape(self.input_names[0], input_shape)
-            print(f"Set input shape to: {input_shape}")
             
-            # 分配内存
+            # 分配内存（每个线程独立）
             self.inputs = []
             self.outputs = []
             self.stream = cuda.Stream()
@@ -95,40 +103,41 @@ class OSNetTensorRTInference:
                 self.outputs.append({'name': name, 'host': host, 'device': device})
                 self.context.set_tensor_address(name, int(device))
             
-            print("✅ OSNet TensorRT engine loaded successfully!")
+            print(f"✅ OSNet TensorRT loaded successfully (thread: {threading.current_thread().name})")
             
         except Exception as e:
             print(f"❌ Failed to load OSNet engine: {e}")
             raise
-        finally:
-            self.cuda_manager.pop()
     
     def preprocess(self, image):
-        """预处理图像"""
-        if len(image.shape) == 3 and image.shape[2] == 3:
-            img = cv2.cvtColor(image, cv2.COLOR_BGR2RGB)
+        """预处理图像 - 快速版本"""
+        # 直接resize
+        if len(image.shape) == 3:
+            img = cv2.resize(image, (self.width, self.height))
         else:
-            img = image
+            img = cv2.cvtColor(image, cv2.COLOR_GRAY2RGB)
+            img = cv2.resize(img, (self.width, self.height))
         
-        img = cv2.resize(img, (self.width, self.height))
+        # BGR转RGB
+        if len(img.shape) == 3 and img.shape[2] == 3:
+            img = cv2.cvtColor(img, cv2.COLOR_BGR2RGB)
         
-        img = img.astype(np.float32) / 255.0
-        mean = np.array([0.485, 0.456, 0.406])
-        std = np.array([0.229, 0.224, 0.225])
+        # 归一化（使用更快的in-place操作）
+        img = img.astype(np.float32, copy=False) / 255.0
+        mean = np.array([0.485, 0.456, 0.406], dtype=np.float32)
+        std = np.array([0.229, 0.224, 0.225], dtype=np.float32)
         img = (img - mean) / std
         
+        # 转换维度 CHW
         img = img.transpose(2, 0, 1)
         img = np.expand_dims(img, axis=0)
         
-        return np.ascontiguousarray(img.astype(np.float32))
-    
-    def _ensure_context(self):
-        """确保CUDA上下文"""
-        self.cuda_manager.push()
+        return np.ascontiguousarray(img)
     
     def extract_feature(self, image):
-        """提取单个图像的特征向量"""
-        self._ensure_context()
+        """提取单个图像的特征向量 - 无上下文切换开销"""
+        if image is None or image.size == 0:
+            return np.zeros(self.feature_dim, dtype=np.float32)
         
         try:
             input_tensor = self.preprocess(image)
@@ -150,7 +159,7 @@ class OSNetTensorRTInference:
             # 获取特征并归一化
             feature = self.outputs[0]['host'][0].flatten()
             norm = np.linalg.norm(feature)
-            if norm > 0:
+            if norm > 1e-6:
                 feature = feature / norm
             
             return feature
@@ -158,15 +167,11 @@ class OSNetTensorRTInference:
         except Exception as e:
             print(f"Feature extraction error: {e}")
             return np.zeros(self.feature_dim, dtype=np.float32)
-        finally:
-            self.cuda_manager.pop()
     
     def extract_features_batch(self, images):
         """批量提取特征向量"""
-        if len(images) == 0:
+        if not images:
             return []
-        
-        self._ensure_context()
         
         try:
             batch_size = len(images)
@@ -204,7 +209,7 @@ class OSNetTensorRTInference:
             for i in range(batch_size):
                 feature = output_data[i].flatten()
                 norm = np.linalg.norm(feature)
-                if norm > 0:
+                if norm > 1e-6:
                     feature = feature / norm
                 features.append(feature)
             
@@ -213,8 +218,6 @@ class OSNetTensorRTInference:
         except Exception as e:
             print(f"Batch feature extraction error: {e}")
             return [np.zeros(self.feature_dim, dtype=np.float32) for _ in range(len(images))]
-        finally:
-            self.cuda_manager.pop()
     
     def _reallocate_buffers(self, batch_size):
         """重新分配缓冲区（当batch size改变时）"""
@@ -290,68 +293,39 @@ def main():
         return
     
     print("="*60)
-    print("Initializing OSNet TensorRT Model")
+    print("Initializing OSNet TensorRT Model (Optimized)")
     print("="*60)
     
     # 创建推理器
     inferencer = OSNetTensorRTInference(engine_path, input_size=(256, 128), batch_size=1)
     
-    # 测试真实图片（如果存在）
-    test_img_path = "/home/wheeltec/Ebike_Human_Follower/src/yolov8_pytorch_detect_tracking/test_img"
-    if os.path.exists(test_img_path):
-        test_images = [f for f in os.listdir(test_img_path) 
-                      if f.lower().endswith(('.jpg', '.jpeg', '.png'))]
-        if test_images:
-            img_path = os.path.join(test_img_path, test_images[0])
-            test_img = cv2.imread(img_path)
-            if test_img is not None:
-                print(f"\nTesting with real image: {test_images[0]}")
-                print(f"Image shape: {test_img.shape}")
-                
-                # 测试单张
-                start = time.time()
-                feature = inferencer.extract_feature(test_img)
-                elapsed = (time.time() - start) * 1000
-                
-                print(f"Feature shape: {feature.shape}")
-                print(f"Feature norm: {np.linalg.norm(feature):.4f}")
-                print(f"Inference time: {elapsed:.2f} ms")
-                
-                # 测试批处理
-                batch_images = [test_img, test_img]
-                start = time.time()
-                features = inferencer.extract_features_batch(batch_images)
-                elapsed = (time.time() - start) * 1000
-                print(f"Batch inference (2 images): {elapsed:.2f} ms")
-                print(f"Batch features count: {len(features)}")
-            else:
-                print("❌ Failed to load test image")
-        else:
-            print("⚠️  No test images found, using random test")
-            # 使用随机测试
-            test_img = np.random.randint(0, 255, (128, 64, 3), dtype=np.uint8)
-            print("\nTesting with random image...")
-            start = time.time()
-            feature = inferencer.extract_feature(test_img)
-            elapsed = (time.time() - start) * 1000
-            print(f"Feature shape: {feature.shape}")
-            print(f"Feature norm: {np.linalg.norm(feature):.4f}")
-            print(f"Inference time: {elapsed:.2f} ms")
-    else:
-        # 使用随机测试
-        test_img = np.random.randint(0, 255, (128, 64, 3), dtype=np.uint8)
-        print("\nTesting with random image...")
-        start = time.time()
-        feature = inferencer.extract_feature(test_img)
-        elapsed = (time.time() - start) * 1000
-        print(f"Feature shape: {feature.shape}")
-        print(f"Feature norm: {np.linalg.norm(feature):.4f}")
-        print(f"Inference time: {elapsed:.2f} ms")
+    # 测试性能
+    test_img = np.random.randint(0, 255, (128, 64, 3), dtype=np.uint8)
     
-    print("\n✅ OSNet TensorRT model ready!")
+    print("\nTesting performance...")
+    
+    # 预热
+    for _ in range(5):
+        _ = inferencer.extract_feature(test_img)
+    
+    # 测试
+    times = []
+    for _ in range(20):
+        start = time.perf_counter()
+        feature = inferencer.extract_feature(test_img)
+        elapsed = (time.perf_counter() - start) * 1000
+        times.append(elapsed)
+    
+    avg_time = np.mean(times)
+    print(f"Feature shape: {feature.shape}")
+    print(f"Feature norm: {np.linalg.norm(feature):.4f}")
+    print(f"Average inference time: {avg_time:.2f} ms")
+    print(f"FPS: {1000/avg_time:.1f}")
+    
+    print("\n✅ OSNet TensorRT model ready (optimized for multi-threading)!")
     print("="*60)
     
-    # 手动清理（确保在程序结束前释放资源）
+    # 清理
     del inferencer
 
 

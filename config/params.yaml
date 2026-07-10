@@ -9,6 +9,6 @@ Yolov8HandTrackNode:
     tracking_protection_time: 5.0
     reid_similarity_threshold: 0.8
     height_change_threshold: 0.15
-    lost_timeout_threshold: 10.0
+    lost_timeout_threshold: 1.0
     use_cuda: true
     roi_threshold: 0.5
